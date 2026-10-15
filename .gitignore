@@ -1,0 +1,9 @@
+.venv/
+.venv-*/
+data/
+node_modules/
+__pycache__/
+*.pt
+*.docx
+.env
+dist/
