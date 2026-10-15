@@ -25,8 +25,8 @@ __pycache__/
 *.pth
 *.h5
 
-# Data & raw datasets
-data/
+# Data & raw datasets (root only)
+/data/
 *.docx
 
 # Environment variables & secrets
