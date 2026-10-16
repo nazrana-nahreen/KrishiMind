@@ -23,6 +23,7 @@ import {
 import { Language, PredictionResult, ClassKey } from '../types';
 import { TRANSLATIONS } from '../data/translations';
 import { DISEASE_DATABASE } from '../data/diseaseDatabase';
+import { runBrowserNeuralInference } from '../services/onnxInference';
 
 interface DetectorProps {
   lang: Language;
@@ -77,7 +78,7 @@ export const Detector: React.FC<DetectorProps> = ({ lang, onViewDiseaseDetails }
   const [feedbackGiven, setFeedbackGiven] = useState<boolean | null>(null);
   const [feedbackComment, setFeedbackComment] = useState('');
   const [feedbackSubmitted, setFeedbackSubmitted] = useState(false);
-  const [engineSource, setEngineSource] = useState<'backend' | 'client_cv'>('client_cv');
+  const [engineSource, setEngineSource] = useState<'backend' | 'onnx_web' | 'client_cv'>('onnx_web');
 
   // Drag & drop handlers
   const handleDrop = (e: React.DragEvent) => {
@@ -133,10 +134,16 @@ export const Detector: React.FC<DetectorProps> = ({ lang, onViewDiseaseDetails }
       setSelectedFile(file);
       runInference(file, explainGradCam, sample.src);
     } catch {
-      // If fetching local file fails, analyze sample directly with verified sample.id
-      setEngineSource('client_cv');
-      const clientResult = await analyzeImageClientSide(sample.src, `${sample.id}_sample.jpg`);
-      setPrediction(clientResult);
+      // If fetching local file fails, analyze sample directly with ONNX Web
+      try {
+        setEngineSource('onnx_web');
+        const neuralResult = await runBrowserNeuralInference(sample.src, lang, `${sample.id}_sample.jpg`);
+        setPrediction(neuralResult);
+      } catch {
+        setEngineSource('client_cv');
+        const clientResult = await analyzeImageClientSide(sample.src, `${sample.id}_sample.jpg`);
+        setPrediction(clientResult);
+      }
     }
   };
 
@@ -228,7 +235,8 @@ export const Detector: React.FC<DetectorProps> = ({ lang, onViewDiseaseDetails }
           const blightRatio = yellowBlightCount / validTotal;
           const tungroRatio = tungroOrangeCount / validTotal;
           const furSkinRatio = furSkinCount / validTotal;
-          const foliageRatio = (healthyGreenCount + yellowBlightCount + tungroOrangeCount + brownSpotCount) / validTotal;
+          // Plant foliage must only be chlorophyll or plant chlorosis/yellows, NOT brown dirt/fur
+          const foliageRatio = (healthyGreenCount + yellowBlightCount + tungroOrangeCount) / validTotal;
 
           // Check filename clues (e.g. from curated test samples)
           const fn = (fileName || '').toLowerCase();
@@ -240,11 +248,11 @@ export const Detector: React.FC<DetectorProps> = ({ lang, onViewDiseaseDetails }
             fn.includes('tungro');
 
           // Out-of-Distribution (OOD) Domain Filter:
-          // If total valid pixels are very low, foliage is negligible (<8%), or animal fur/skin is dominant (>28% fur/skin and <15% foliage)
+          // Strictly reject if foliage chlorophyll is below 12%, or animal fur/skin is dominant (>20% fur/skin and <18% foliage)
           const isInvalidNonPlant =
             !isSample &&
-            (foliageRatio < 0.08 ||
-              (furSkinRatio > 0.28 && foliageRatio < 0.15) ||
+            (foliageRatio < 0.12 ||
+              (furSkinRatio > 0.20 && foliageRatio < 0.18) ||
               validTotal < 350);
 
           if (isInvalidNonPlant) {
@@ -282,23 +290,22 @@ export const Detector: React.FC<DetectorProps> = ({ lang, onViewDiseaseDetails }
             determinedLabel = 'brown_spot';
           } else {
             // Real Pixel Analysis for uploaded leaf images:
-            if (greenRatio >= 0.45 && brownRatio < 0.045 && blightRatio < 0.05) {
-              // Predominantly healthy green leaf with negligible spots
+            if (greenRatio >= 0.55 && brownRatio < 0.035 && blightRatio < 0.035) {
+              // Predominantly healthy green leaf
               determinedLabel = 'healthy_leaf';
-            } else if (brownRatio >= 0.045 || (brownRatio > blightRatio && brownRatio > tungroRatio && brownRatio > 0.02)) {
-              // Localized brown lesions detected
-              determinedLabel = 'brown_spot';
-            } else if (blightRatio >= tungroRatio && blightRatio > 0.04) {
-              // Yellow margin stripes detected
+            } else if (blightRatio >= 0.035 || (blightRatio > 0.02 && blightRatio >= brownRatio * 0.6)) {
+              // Bacterial leaf blight: yellow margins and stripes along leaf blades
               determinedLabel = 'bacterial_leaf_blight';
-            } else if (tungroRatio > 0.04) {
-              // Orange-yellow tip chlorosis detected
+            } else if (tungroRatio > 0.04 && tungroRatio >= blightRatio) {
+              // Tungro virus: characteristic orange/yellow tip discoloration
               determinedLabel = 'tungro_virus';
+            } else if (brownRatio >= 0.03) {
+              // Brown spot: localized brown lesions on leaf
+              determinedLabel = 'brown_spot';
             } else if (greenRatio >= 0.35) {
-              // Default to healthy if leaf is primarily green
               determinedLabel = 'healthy_leaf';
             } else {
-              determinedLabel = 'healthy_leaf';
+              determinedLabel = 'bacterial_leaf_blight';
             }
           }
 
@@ -451,22 +458,41 @@ export const Detector: React.FC<DetectorProps> = ({ lang, onViewDiseaseDetails }
       setPrediction(data);
       setEngineSource('backend');
     } catch {
-      // 2. Fallback: Run In-Browser Computer Vision Analysis on actual leaf pixels
-      setEngineSource('client_cv');
-      const clientResult = await analyzeImageClientSide(currentUrl, file.name);
-      if (clientResult.is_valid_leaf === false || clientResult.isValidLeaf === false) {
-        setPrediction(null);
-        setInvalidLeafError({
-          title: lang === 'bn' ? 'অপ্রাসঙ্গিক ছবি সনাক্ত হয়েছে!' : 'Non-Plant / Invalid Image Detected!',
-          message:
-            clientResult.message ||
-            (lang === 'bn'
-              ? 'ছবিটিতে কোনো ধান পাতার লক্ষণ পাওয়া যায়নি। বিড়াল, কুকুর বা অন্য কোনো প্রাণীর ছবি দিয়ে ধানের রোগ নির্ণয় সম্ভব নয়।'
-              : 'No rice leaf chlorophyll detected. The system cannot diagnose animals, people, or arbitrary items.'),
-        });
-        return;
+      // 2. Client-side Real MobileNetV3 Deep Learning Inference using ONNX Runtime Web
+      try {
+        setEngineSource('onnx_web');
+        const neuralResult = await runBrowserNeuralInference(currentUrl, lang, file.name);
+        if (neuralResult.is_valid_leaf === false || neuralResult.isValidLeaf === false) {
+          setPrediction(null);
+          setInvalidLeafError({
+            title: lang === 'bn' ? 'অপ্রাসঙ্গিক ছবি সনাক্ত হয়েছে!' : 'Non-Plant / Invalid Image Detected!',
+            message:
+              neuralResult.message ||
+              (lang === 'bn'
+                ? 'ছবিটিতে কোনো ধান পাতার লক্ষণ পাওয়া যায়নি। এটি বিড়াল, কুকুর, মানুষ বা অন্য কোনো বস্তুর ছবি হতে পারে। আমাদের এআই মডেল শুধুমাত্র ধান পাতার ৪টি অবস্থা সনাক্ত করতে পারে।'
+                : 'No rice leaf chlorophyll detected. The system cannot diagnose animals, people, or arbitrary items.'),
+          });
+          return;
+        }
+        setPrediction(neuralResult);
+      } catch (onnxErr) {
+        console.warn('Falling back to local computer vision analysis:', onnxErr);
+        setEngineSource('client_cv');
+        const fallbackResult = await analyzeImageClientSide(currentUrl, file.name);
+        if (fallbackResult.is_valid_leaf === false || fallbackResult.isValidLeaf === false) {
+          setPrediction(null);
+          setInvalidLeafError({
+            title: lang === 'bn' ? 'অপ্রাসঙ্গিক ছবি সনাক্ত হয়েছে!' : 'Non-Plant / Invalid Image Detected!',
+            message:
+              fallbackResult.message ||
+              (lang === 'bn'
+                ? 'ছবিটিতে কোনো ধান পাতার লক্ষণ পাওয়া যায়নি। বিড়াল, কুকুর বা অন্য কোনো প্রাণীর ছবি দিয়ে ধানের রোগ নির্ণয় সম্ভব নয়।'
+                : 'No rice leaf chlorophyll detected. The system cannot diagnose animals, people, or arbitrary items.'),
+          });
+          return;
+        }
+        setPrediction(fallbackResult);
       }
-      setPrediction(clientResult);
     } finally {
       setIsScanning(false);
     }
@@ -764,12 +790,16 @@ export const Detector: React.FC<DetectorProps> = ({ lang, onViewDiseaseDetails }
                       <span className={`text-[11px] font-bold px-3 py-1 rounded-full flex items-center gap-1.5 border ${
                         engineSource === 'backend'
                           ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
+                          : engineSource === 'onnx_web'
+                          ? 'bg-blue-50 text-blue-800 border-blue-300'
                           : 'bg-teal-50 text-teal-800 border-teal-300'
                       }`}>
                         <Cpu className="w-3.5 h-3.5" />
                         <span>
                           {engineSource === 'backend'
                             ? (lang === 'bn' ? 'মডেল: মোবাইলনেট-ভি৩ (ফাস্টএপিআই ব্যাকএন্ড)' : 'Model: MobileNetV3-Small (FastAPI Server)')
+                            : engineSource === 'onnx_web'
+                            ? (lang === 'bn' ? 'অন-ডিভাইস ডিপ লার্নিং: মোবাইলনেট-ভি৩ (ওয়েব নিউরাল নেটওয়ার্ক)' : 'On-Device AI: MobileNetV3 (Web Neural Network)')
                             : (lang === 'bn' ? 'অন-ডিভাইস কম্পিউটার ভিশন (কালার ও লেশন অ্যানালাইসিস)' : 'In-Browser Vision: Real-time Leaf Pixel Analysis')}
                         </span>
                       </span>

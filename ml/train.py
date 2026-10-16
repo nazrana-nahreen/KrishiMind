@@ -1,12 +1,11 @@
-"""MobileNetV3-Small transfer learning.
-Phase 1: শুধু নতুন head train, Phase 2: পুরো model fine-tune.
-Test set শুধু শেষে একবার ব্যবহার হয়।"""
+"""MobileNetV3-Small transfer learning with pathology-preserving augmentation,
+CosineAnnealingLR schedule, label smoothing, and automatic self-contained ONNX export."""
 import json
+import shutil
 import time
 from pathlib import Path
 
 import matplotlib
-
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
@@ -19,18 +18,20 @@ from torchvision import datasets, models, transforms
 SPLIT = Path("data/split")
 MODELS = Path("models")
 DOCS = Path("docs")
+PUBLIC = Path("frontend/public")
 IMG, BS, SEED = 224, 32, 42
-EPOCHS_HEAD, EPOCHS_FT = 3, 8
+EPOCHS_HEAD, EPOCHS_FT = 4, 14
 MEAN, STD = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
 
 
 def make_loaders():
     train_tf = transforms.Compose([
-        transforms.RandomResizedCrop(IMG, scale=(0.7, 1.0)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomVerticalFlip(),
-        transforms.RandomRotation(20),
-        transforms.ColorJitter(0.2, 0.2, 0.2),
+        transforms.Resize((IMG, IMG)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.3),
+        transforms.RandomRotation(degrees=15),
+        # Subtle lighting variations without shifting disease hues:
+        transforms.ColorJitter(brightness=0.12, contrast=0.15),
         transforms.ToTensor(),
         transforms.Normalize(MEAN, STD),
     ])
@@ -66,18 +67,22 @@ def run_epoch(model, loader, loss_fn, device, opt=None):
 
 
 def fit(model, dl, loss_fn, device, params, lr, epochs, best, tag):
-    opt = torch.optim.AdamW(params, lr=lr)
+    opt = torch.optim.AdamW(params, lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-6)
     for ep in range(1, epochs + 1):
-        t = time.time()
+        t0 = time.time()
         tl, ta = run_epoch(model, dl["train"], loss_fn, device, opt)
         vl, va = run_epoch(model, dl["val"], loss_fn, device)
+        scheduler.step()
         mark = ""
-        if va > best["acc"]:
+        # Save model if validation accuracy is best, or equal with lower loss
+        if va > best["acc"] or (va == best["acc"] and vl < best["loss"]):
             best["acc"] = va
+            best["loss"] = vl
             torch.save(model.state_dict(), MODELS / "model.pt")
             mark = "  <- best"
-        print(f"[{tag}] ep {ep}/{epochs}  train {ta:.3f}  val {va:.3f}  "
-              f"val_loss {vl:.3f}  {time.time() - t:.0f}s{mark}", flush=True)
+        print(f"[{tag}] ep {ep:02d}/{epochs:02d}  train_acc {ta:.3f}  val_acc {va:.3f}  "
+              f"val_loss {vl:.3f}  {time.time() - t0:.1f}s{mark}", flush=True)
 
 
 def evaluate(model, dl, classes, device):
@@ -88,7 +93,7 @@ def evaluate(model, dl, classes, device):
             ps += model(x.to(device)).argmax(1).cpu().tolist()
             ys += y.tolist()
     text = classification_report(ys, ps, target_names=classes, digits=3)
-    print("\nTEST RESULTS\n" + text)
+    print("\nFINAL TEST RESULTS\n" + text)
     rep = classification_report(ys, ps, target_names=classes, output_dict=True)
     cm = confusion_matrix(ys, ps)
 
@@ -114,17 +119,46 @@ def evaluate(model, dl, classes, device):
     ax.set_title(f"Confusion matrix (test acc {rep['accuracy']:.3f})")
     fig.tight_layout()
     fig.savefig(DOCS / "confusion_matrix.png", dpi=150)
+    fig.savefig(PUBLIC / "confusion_matrix.png", dpi=150)
+
+
+def export_onnx(model, device):
+    """Export self-contained ONNX model for client-side in-browser inference."""
+    model.eval()
+    dummy = torch.randn(1, 3, IMG, IMG).to(device)
+    model_onnx = MODELS / "model.onnx"
+    public_onnx = PUBLIC / "model.onnx"
+    
+    torch.onnx.export(
+        model,
+        dummy,
+        str(model_onnx),
+        export_params=True,
+        input_names=["input"],
+        output_names=["output"],
+        opset_version=13,
+        do_constant_folding=True,
+        dynamo=False,
+    )
+    # Remove any stray .data file if created
+    data_file = MODELS / "model.onnx.data"
+    if data_file.exists():
+        data_file.unlink()
+
+    shutil.copy2(model_onnx, public_onnx)
+    print(f"ONNX Model exported: {public_onnx} ({public_onnx.stat().st_size} bytes)")
 
 
 def main():
     torch.manual_seed(SEED)
     MODELS.mkdir(exist_ok=True)
     DOCS.mkdir(exist_ok=True)
+    PUBLIC.mkdir(exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     ds, dl = make_loaders()
     classes = ds["train"].classes
     (MODELS / "classes.json").write_text(json.dumps(classes))
-    print("device:", device, "| classes:", classes, "| train:", len(ds["train"]))
+    print("device:", device, "| classes:", classes, "| train images:", len(ds["train"]))
 
     model = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT)
     model.classifier[3] = nn.Linear(model.classifier[3].in_features, len(classes))
@@ -132,18 +166,24 @@ def main():
 
     counts = np.bincount(ds["train"].targets)
     w = torch.tensor(counts.sum() / (len(classes) * counts), dtype=torch.float32)
-    loss_fn = nn.CrossEntropyLoss(weight=w.to(device))
+    loss_fn = nn.CrossEntropyLoss(weight=w.to(device), label_smoothing=0.08)
 
-    best = {"acc": 0.0}
+    best = {"acc": 0.0, "loss": float("inf")}
+    
+    print("\n--- Phase 1: Classifier Head Training ---")
     for p in model.features.parameters():
         p.requires_grad = False
     fit(model, dl, loss_fn, device, model.classifier.parameters(), 1e-3, EPOCHS_HEAD, best, "head")
+    
+    print("\n--- Phase 2: End-to-End Fine-Tuning with Cosine Annealing ---")
     for p in model.parameters():
         p.requires_grad = True
-    fit(model, dl, loss_fn, device, model.parameters(), 1e-4, EPOCHS_FT, best, "finetune")
+    fit(model, dl, loss_fn, device, model.parameters(), 1.5e-4, EPOCHS_FT, best, "finetune")
 
+    # Load best checkpoint
     model.load_state_dict(torch.load(MODELS / "model.pt", map_location=device))
     evaluate(model, dl, classes, device)
+    export_onnx(model, device)
 
 
 if __name__ == "__main__":
