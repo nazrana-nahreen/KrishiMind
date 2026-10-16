@@ -8,6 +8,10 @@ export interface PredictionResult {
   uncertain: boolean;
   probabilities: Record<string, number>;
   heatmap?: string | null;
+  is_valid_leaf?: boolean;
+  isValidLeaf?: boolean;
+  error?: string;
+  message?: string;
 }
 
 export interface DiseaseDetail {

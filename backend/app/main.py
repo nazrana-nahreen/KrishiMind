@@ -102,6 +102,36 @@ def metrics():
     return json.loads((MODELS / "metrics.json").read_text())
 
 
+def validate_rice_leaf(img: Image.Image) -> tuple[bool, str]:
+    """Check if uploaded image actually contains plant foliage / rice leaf characteristics."""
+    arr = np.array(img.resize((128, 128)), dtype=np.float32)
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+
+    # ExG (Excess Green): 2G - R - B
+    exg = 2 * g - r - b
+
+    # Green foliage pixels: green channel dominates and ExG > 8
+    green_foliage = (g > r * 1.05) & (g > b * 1.15) & (exg > 8)
+
+    # Chlorotic yellow plant tissue (typical in blight or tungro)
+    yellow_foliage = (r > 120) & (g > 110) & (b < 110) & (np.abs(r - g) < 55) & (g > b * 1.15)
+
+    # Total plant leaf pixels
+    foliage_ratio = float(np.mean(green_foliage | yellow_foliage))
+
+    # Skin / animal fur detection (typical in cats, dogs, humans, pets)
+    fur_skin = (r > 90) & (r > g * 1.18) & (r > b * 1.35) & (g > b)
+    fur_skin_ratio = float(np.mean(fur_skin))
+
+    # If the image has almost no green or plant tissue (less than 8%), or is dominated by animal fur/skin
+    if foliage_ratio < 0.08:
+        return False, "ছবিটিতে কোনো ধান বা উদ্ভিদের পাতার ক্লোরোফিল/টিস্যু পাওয়া যায়নি। বিড়াল, কুকুর, মানুষ বা অপ্রাসঙ্গিক বস্তুর ছবি গ্রহণযোগ্য নয়।"
+    if fur_skin_ratio > 0.28 and foliage_ratio < 0.12:
+        return False, "ছবিটিতে প্রাণী বা মানুষের ত্বকের বৈশিষ্ট্য পাওয়া গেছে। অনুগ্রহ করে শুধুমাত্র ধান গাছের পাতার স্পষ্ট ছবি আপলোড করুন।"
+
+    return True, ""
+
+
 @app.post("/predict")
 def predict(file: UploadFile = File(...), explain: bool = True):
     if file.content_type not in ALLOWED:
@@ -114,9 +144,24 @@ def predict(file: UploadFile = File(...), explain: bool = True):
     except (UnidentifiedImageError, OSError):
         raise HTTPException(400, "ছবিটি পড়া যাচ্ছে না")
 
+    # Validate that image is actually a plant/rice leaf
+    is_valid, validation_msg = validate_rice_leaf(img)
+    if not is_valid:
+        return {
+            "is_valid_leaf": False,
+            "error": "not_a_rice_leaf",
+            "message": validation_msg,
+            "label": "invalid_non_leaf",
+            "confidence": 0.0,
+            "uncertain": True,
+            "probabilities": {c: 0.0 for c in state["classes"]},
+            "heatmap": None,
+        }
+
     probs, idx, cam = infer(TF(img).unsqueeze(0))
     conf = float(probs[idx])
     return {
+        "is_valid_leaf": True,
         "label": state["classes"][idx],
         "confidence": conf,
         "uncertain": conf < THRESHOLD,

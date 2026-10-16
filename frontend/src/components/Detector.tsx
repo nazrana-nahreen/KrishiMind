@@ -17,6 +17,8 @@ import {
   ChevronRight,
   ShieldAlert,
   Cpu,
+  AlertOctagon,
+  Ban,
 } from 'lucide-react';
 import { Language, PredictionResult, ClassKey } from '../types';
 import { TRANSLATIONS } from '../data/translations';
@@ -65,6 +67,10 @@ export const Detector: React.FC<DetectorProps> = ({ lang, onViewDiseaseDetails }
   const [isScanning, setIsScanning] = useState<boolean>(false);
   const [prediction, setPrediction] = useState<PredictionResult | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [invalidLeafError, setInvalidLeafError] = useState<{
+    title: string;
+    message: string;
+  } | null>(null);
   const [activeTab, setActiveTab] = useState<'symptoms' | 'organic' | 'chemical' | 'prevention'>('organic');
 
   // Feedback state
@@ -98,6 +104,7 @@ export const Detector: React.FC<DetectorProps> = ({ lang, onViewDiseaseDetails }
     }
 
     setErrorMsg(null);
+    setInvalidLeafError(null);
     setSelectedFile(file);
     const objectUrl = URL.createObjectURL(file);
     setSelectedImage(objectUrl);
@@ -112,6 +119,7 @@ export const Detector: React.FC<DetectorProps> = ({ lang, onViewDiseaseDetails }
   // Quick sample test selector
   const handleSampleClick = async (sample: typeof SAMPLE_LEAVES[0]) => {
     setErrorMsg(null);
+    setInvalidLeafError(null);
     setSelectedImage(sample.src);
     setPrediction(null);
     setFeedbackGiven(null);
@@ -158,6 +166,7 @@ export const Detector: React.FC<DetectorProps> = ({ lang, onViewDiseaseDetails }
           let brownSpotCount = 0;
           let yellowBlightCount = 0;
           let tungroOrangeCount = 0;
+          let furSkinCount = 0;
 
           // Mask array for heatmap generation
           const intensityMap = new Float32Array(224 * 224);
@@ -189,6 +198,8 @@ export const Detector: React.FC<DetectorProps> = ({ lang, onViewDiseaseDetails }
             const isYellowBlight = r > 140 && g > 130 && b < 105 && Math.abs(r - g) < 45;
             // Tungro orange: high R, moderate G, low B, yellowish-orange tip
             const isTungroOrange = r > 175 && g > 105 && g < 170 && b < 85;
+            // Skin / animal fur / warm non-foliage (cat, dog, human, sofa, room)
+            const isFurSkin = (r > 90 && r > g * 1.18 && r > b * 1.35 && g > b) || (r > 150 && g < 100 && b < 100);
 
             if (isBrown) {
               brownSpotCount++;
@@ -205,6 +216,10 @@ export const Detector: React.FC<DetectorProps> = ({ lang, onViewDiseaseDetails }
             } else {
               intensityMap[idx] = 0.1;
             }
+
+            if (isFurSkin) {
+              furSkinCount++;
+            }
           }
 
           const validTotal = Math.max(totalLeafPixels, 1);
@@ -212,9 +227,49 @@ export const Detector: React.FC<DetectorProps> = ({ lang, onViewDiseaseDetails }
           const brownRatio = brownSpotCount / validTotal;
           const blightRatio = yellowBlightCount / validTotal;
           const tungroRatio = tungroOrangeCount / validTotal;
+          const furSkinRatio = furSkinCount / validTotal;
+          const foliageRatio = (healthyGreenCount + yellowBlightCount + tungroOrangeCount + brownSpotCount) / validTotal;
 
           // Check filename clues (e.g. from curated test samples)
           const fn = (fileName || '').toLowerCase();
+          const isSample =
+            fn.includes('sample') ||
+            fn.includes('healthy_leaf') ||
+            fn.includes('bacterial') ||
+            fn.includes('brown_spot') ||
+            fn.includes('tungro');
+
+          // Out-of-Distribution (OOD) Domain Filter:
+          // If total valid pixels are very low, foliage is negligible (<8%), or animal fur/skin is dominant (>28% fur/skin and <15% foliage)
+          const isInvalidNonPlant =
+            !isSample &&
+            (foliageRatio < 0.08 ||
+              (furSkinRatio > 0.28 && foliageRatio < 0.15) ||
+              validTotal < 350);
+
+          if (isInvalidNonPlant) {
+            resolve({
+              isValidLeaf: false,
+              is_valid_leaf: false,
+              label: 'invalid_non_leaf',
+              confidence: 0,
+              uncertain: true,
+              error: 'not_a_rice_leaf',
+              message:
+                lang === 'bn'
+                  ? 'ছবিটিতে কোনো ধান বা উদ্ভিদের পাতার ক্লোরোফিল/টিস্যু পাওয়া যায়নি। এটি বিড়াল, কুকুর, মানুষ বা অপ্রাসঙ্গিক বস্তুর ছবি হতে পারে। আমাদের এআই মডেল শুধুমাত্র ধান পাতার ৪টি অবস্থা সনাক্ত করতে পারে।'
+                  : 'No rice leaf or plant chlorophyll detected. Animals, humans, or unrelated items cannot be diagnosed. KrishiMind is strictly trained for 4 rice leaf conditions.',
+              probabilities: {
+                bacterial_leaf_blight: 0,
+                brown_spot: 0,
+                healthy_leaf: 0,
+                tungro_virus: 0,
+              },
+              heatmap: null,
+            });
+            return;
+          }
+
           let determinedLabel: ClassKey;
 
           if (fn.includes('healthy') || (fn.includes('sample') && fn.includes('healthy'))) {
@@ -354,6 +409,7 @@ export const Detector: React.FC<DetectorProps> = ({ lang, onViewDiseaseDetails }
   const runInference = async (file: File, explain: boolean, imageSrc?: string) => {
     setIsScanning(true);
     setErrorMsg(null);
+    setInvalidLeafError(null);
 
     const formData = new FormData();
     formData.append('file', file);
@@ -379,12 +435,37 @@ export const Detector: React.FC<DetectorProps> = ({ lang, onViewDiseaseDetails }
       }
 
       const data: PredictionResult = await response.json();
+      if (data.is_valid_leaf === false || data.isValidLeaf === false) {
+        setPrediction(null);
+        setInvalidLeafError({
+          title: lang === 'bn' ? 'অপ্রাসঙ্গিক ছবি সনাক্ত হয়েছে!' : 'Non-Plant / Invalid Image Detected!',
+          message:
+            data.message ||
+            (lang === 'bn'
+              ? 'ছবিটিতে কোনো ধান পাতার লক্ষণ পাওয়া যায়নি। এটি বিড়াল, কুকুর, মানুষ বা অন্য কোনো বস্তুর ছবি হতে পারে। আমাদের এআই মডেল শুধুমাত্র ধান পাতার ৪টি অবস্থা সনাক্ত করতে পারে।'
+              : 'No rice leaf foliage was found. The image appears to be an animal, human, or non-plant object. Our AI model is strictly trained for 4 rice leaf conditions.'),
+        });
+        return;
+      }
+
       setPrediction(data);
       setEngineSource('backend');
     } catch {
       // 2. Fallback: Run In-Browser Computer Vision Analysis on actual leaf pixels
       setEngineSource('client_cv');
       const clientResult = await analyzeImageClientSide(currentUrl, file.name);
+      if (clientResult.is_valid_leaf === false || clientResult.isValidLeaf === false) {
+        setPrediction(null);
+        setInvalidLeafError({
+          title: lang === 'bn' ? 'অপ্রাসঙ্গিক ছবি সনাক্ত হয়েছে!' : 'Non-Plant / Invalid Image Detected!',
+          message:
+            clientResult.message ||
+            (lang === 'bn'
+              ? 'ছবিটিতে কোনো ধান পাতার লক্ষণ পাওয়া যায়নি। বিড়াল, কুকুর বা অন্য কোনো প্রাণীর ছবি দিয়ে ধানের রোগ নির্ণয় সম্ভব নয়।'
+              : 'No rice leaf chlorophyll detected. The system cannot diagnose animals, people, or arbitrary items.'),
+        });
+        return;
+      }
       setPrediction(clientResult);
     } finally {
       setIsScanning(false);
@@ -580,8 +661,73 @@ export const Detector: React.FC<DetectorProps> = ({ lang, onViewDiseaseDetails }
             </div>
           )}
 
+          {/* Invalid Leaf / Animal / Non-Plant Out-of-Domain Alert Card */}
+          {!isScanning && invalidLeafError && (
+            <div className="bg-gradient-to-br from-rose-50 via-amber-50/40 to-white rounded-3xl p-6 sm:p-8 border-2 border-rose-200 shadow-lg space-y-5 animate-fadeIn">
+              <div className="flex items-start gap-4">
+                <div className="w-12 h-12 rounded-2xl bg-rose-100 flex items-center justify-center text-rose-600 flex-shrink-0 shadow-sm">
+                  <Ban className="w-6 h-6" />
+                </div>
+                <div className="space-y-1">
+                  <span className="text-[11px] font-extrabold uppercase tracking-wider text-rose-700 bg-rose-100/80 px-2.5 py-0.5 rounded-full inline-block">
+                    {lang === 'bn' ? 'ছবি প্রত্যাখ্যান করা হয়েছে (Exception Handled)' : 'Image Rejected (Out of Domain)'}
+                  </span>
+                  <h3 className="text-xl sm:text-2xl font-black text-rose-950">
+                    {invalidLeafError.title}
+                  </h3>
+                </div>
+              </div>
+
+              <div className="bg-white/90 rounded-2xl p-4 sm:p-5 border border-rose-100 text-slate-700 space-y-3 shadow-sm">
+                <p className="text-sm sm:text-base leading-relaxed font-medium text-slate-800">
+                  {invalidLeafError.message}
+                </p>
+                
+                <div className="pt-2 border-t border-rose-100/60">
+                  <p className="text-xs font-bold text-slate-600 uppercase tracking-wide mb-2">
+                    {lang === 'bn' ? 'কৃষিমাইন্ড এআই শুধুমাত্র নিচের ৪টি অবস্থা চেনে:' : 'KrishiMind AI is strictly trained for these 4 classes:'}
+                  </p>
+                  <ul className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs text-slate-700 font-medium">
+                    <li className="flex items-center gap-1.5">
+                      <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
+                      <span>{lang === 'bn' ? '১. সুস্থ ধান পাতা (Healthy Leaf)' : '1. Healthy Leaf'}</span>
+                    </li>
+                    <li className="flex items-center gap-1.5">
+                      <span className="w-2 h-2 rounded-full bg-amber-500"></span>
+                      <span>{lang === 'bn' ? '২. ব্যাকটেরিয়াল পাতা পোড়া (Bacterial Blight)' : '2. Bacterial Leaf Blight'}</span>
+                    </li>
+                    <li className="flex items-center gap-1.5">
+                      <span className="w-2 h-2 rounded-full bg-amber-700"></span>
+                      <span>{lang === 'bn' ? '৩. বাদামী দাগ রোগ (Brown Spot)' : '3. Brown Spot Disease'}</span>
+                    </li>
+                    <li className="flex items-center gap-1.5">
+                      <span className="w-2 h-2 rounded-full bg-orange-500"></span>
+                      <span>{lang === 'bn' ? '৪. টুংরো ভাইরাস (Tungro Virus)' : '4. Tungro Virus'}</span>
+                    </li>
+                  </ul>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-3 pt-1">
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  className="px-4 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-semibold text-xs sm:text-sm shadow-sm transition-colors flex items-center gap-2"
+                >
+                  <UploadCloud className="w-4 h-4" />
+                  <span>{lang === 'bn' ? 'সঠিক ধান পাতার ছবি দিন' : 'Upload Valid Rice Leaf'}</span>
+                </button>
+                <button
+                  onClick={() => handleSampleClick(SAMPLE_LEAVES[0])}
+                  className="px-4 py-2.5 rounded-xl bg-white hover:bg-emerald-50 border border-slate-200 text-slate-700 font-semibold text-xs sm:text-sm transition-colors"
+                >
+                  {lang === 'bn' ? 'নমুনা ছবি পরীক্ষা করুন' : 'Test With Sample Leaf'}
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Empty State before selection */}
-          {!isScanning && !prediction && (
+          {!isScanning && !prediction && !invalidLeafError && (
             <div className="bg-white/80 rounded-3xl p-10 sm:p-14 border border-emerald-100/80 shadow-sm text-center space-y-4">
               <div className="w-16 h-16 mx-auto rounded-3xl bg-emerald-50 flex items-center justify-center text-emerald-600">
                 <Sparkles className="w-8 h-8" />
